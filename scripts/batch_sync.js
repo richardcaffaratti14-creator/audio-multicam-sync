@@ -18,6 +18,7 @@ const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
 const { loadInt16, meanRemove, globalXcorr, localSearch } = require('./xcorr_lib');
+const earshot = require('./earshot_bridge');
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -173,6 +174,50 @@ if (MIN_DURATION > 0) {
   console.log('--min-duration ' + MIN_DURATION + 's: ' + clips.length + '/' + before + ' clips entran en esta corrida (el resto queda para una fase 2).');
 }
 if (!clips.length) { console.error('Ningún clip pasó el filtro --min-duration.'); process.exit(1); }
+
+// ---------------------------------------------------------------------------
+// PRESCREEN: earshot measure on each clip before correlation (--prescreen flag).
+// No AI models — fast. Extracts a 60s chunk from 30% into each clip and measures
+// integrated LUFS + noise floor. Used to:
+//   1. Flag 'weak' / 'silent' clips that will likely produce low-ratio correlation
+//      (camera far from speakers, lens cap on, pocket camarazo).
+//   2. Lower LOCAL_ACCEPT_NCC threshold per-clip for weak-signal clips so they
+//      don't fall through to needs_review when their predicted offset is right.
+//   3. Write signal_quality / signal_lufs into the output JSON for the user to see.
+// ---------------------------------------------------------------------------
+const PRESCREEN_DIR = path.join(WORKDIR, 'prescreen');
+if (args.prescreen) {
+  if (!earshot.EARSHOT_EXE) {
+    console.warn('ADVERTENCIA: earshot no encontrado, --prescreen ignorado.');
+  } else {
+    fs.mkdirSync(PRESCREEN_DIR, { recursive: true });
+    console.log('\n--- PRESCREEN DE SEÑAL (earshot measure, sin modelos) ---');
+    for (let i = 0; i < clips.length; i++) {
+      const c = clips[i];
+      const safe = (c.group + '__' + c.file).replace(/[^A-Za-z0-9._-]/g, '_');
+      const wavPath = path.join(PRESCREEN_DIR, safe + '.wav');
+      const chunkStart = Math.min(30, (c.meta.duration || 120) * 0.3);
+      try {
+        earshot.extractAudioWav(c.nativePath, wavPath, { start: chunkStart, duration: 60 });
+        const m = earshot.measure(wavPath);
+        c.signalLufs = m.lufs ?? null;
+        c.signalNoiseFloor = m.noise_floor_dbfs ?? null;
+        c.signalQuality = earshot.classifySignal(m);
+        try { fs.unlinkSync(wavPath); } catch (e) { /* cleanup best-effort */ }
+      } catch (e) {
+        c.signalQuality = 'unknown';
+        console.warn('  ' + c.group + '/' + c.file + ': earshot measure falló — ' + e.message.slice(0, 80));
+      }
+      if ((i + 1) % 10 === 0 || i === clips.length - 1)
+        console.log('  ' + (i + 1) + '/' + clips.length + ' prescreened');
+    }
+    const byQuality = { good: 0, weak: 0, silent: 0, unknown: 0 };
+    for (const c of clips) byQuality[c.signalQuality || 'unknown']++;
+    console.log('  Señal — good:', byQuality.good, '| weak:', byQuality.weak, '| silent:', byQuality.silent, '| unknown:', byQuality.unknown);
+    if (byQuality.weak + byQuality.silent > 0)
+      console.log('  NOTA: clips weak/silent suelen dar peakToSecondRatio bajo. Si salen needs_review revisalos a mano.');
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Extract low-frequency envelope (kick/bass transients) at low sample rate.
@@ -543,6 +588,81 @@ for (const c of clips) {
 }
 
 // ---------------------------------------------------------------------------
+// VERIFY: earshot ab on overlapping clip pairs across cameras (--verify flag).
+// Uses CLAP model (~20-60s first call). For each unique pair of cameras, picks
+// the clip pair with the longest overlap on the shared timeline, extracts 30s
+// of audio at the midpoint of that overlap from both clips, and runs earshot ab.
+// cosine_ab >= 0.75 = sounds like the same event (same DJ set, same room).
+// Adds earshot_cosine to each clip's JSON; warns on cosine_ab < 0.5.
+// ---------------------------------------------------------------------------
+const VERIFY_DIR = path.join(WORKDIR, 'verify');
+if (args.verify) {
+  if (!earshot.EARSHOT_EXE) {
+    console.warn('ADVERTENCIA: earshot no encontrado, --verify ignorado.');
+  } else {
+    fs.mkdirSync(VERIFY_DIR, { recursive: true });
+    console.log('\n--- VERIFICACIÓN POR EARSHOT AB (pares de cámaras solapadas) ---');
+
+    // Compute global start/end for each 'ok' clip on the shared timeline.
+    const okClips = clips.filter((c) => c.status === 'ok' && c.finalOffset !== null && trackOrigin.has(c.finalTrackIndex));
+    for (const c of okClips) {
+      const origin = trackOrigin.get(c.finalTrackIndex);
+      c._globalStart = c.finalOffset + origin;
+      c._globalEnd = c._globalStart + (c.meta.duration || 0);
+    }
+
+    // For each unique pair of camera groups, find the clip pair with maximum overlap.
+    const groupNames = Array.from(new Set(okClips.map((c) => c.group)));
+    let verifyCount = 0;
+    for (let gi = 0; gi < groupNames.length; gi++) {
+      for (let gj = gi + 1; gj < groupNames.length; gj++) {
+        const clipsA = okClips.filter((c) => c.group === groupNames[gi]);
+        const clipsB = okClips.filter((c) => c.group === groupNames[gj]);
+        let bestOverlap = 0, bestA = null, bestB = null;
+        for (const a of clipsA) {
+          for (const b of clipsB) {
+            const overlap = Math.min(a._globalEnd, b._globalEnd) - Math.max(a._globalStart, b._globalStart);
+            if (overlap > bestOverlap) { bestOverlap = overlap; bestA = a; bestB = b; }
+          }
+        }
+        if (!bestA || bestOverlap < 30) continue; // need at least 30s overlap
+
+        // Extract 30s at the middle of the overlap.
+        const overlapStart = Math.max(bestA._globalStart, bestB._globalStart);
+        const overlapMid = overlapStart + bestOverlap / 2;
+        const windowS = Math.min(30, bestOverlap * 0.5);
+        const startInA = overlapMid - windowS / 2 - bestA._globalStart;
+        const startInB = overlapMid - windowS / 2 - bestB._globalStart;
+
+        const pairId = groupNames[gi].replace(/[^A-Za-z0-9]/g, '_') + '__vs__' + groupNames[gj].replace(/[^A-Za-z0-9]/g, '_');
+        const wavA = path.join(VERIFY_DIR, pairId + '_A.wav');
+        const wavB = path.join(VERIFY_DIR, pairId + '_B.wav');
+        try {
+          earshot.extractAudioWav(bestA.nativePath, wavA, { start: Math.max(0, startInA), duration: windowS });
+          earshot.extractAudioWav(bestB.nativePath, wavB, { start: Math.max(0, startInB), duration: windowS });
+          const res = earshot.ab(wavA, wavB);
+          const cosine = res.cosine_ab ?? null;
+          bestA.earshotCosine = cosine;
+          bestB.earshotCosine = cosine;
+          const verdict = cosine >= 0.75 ? 'OK' : cosine >= 0.5 ? 'DUDOSO' : 'SOSPECHOSO';
+          console.log('  ' + groupNames[gi] + ' vs ' + groupNames[gj]
+            + ' | cosine=' + (cosine != null ? cosine.toFixed(3) : '?')
+            + ' | ' + verdict
+            + ' | via: ' + bestA.file + ' + ' + bestB.file);
+          if (cosine !== null && cosine < 0.5)
+            console.log('    ⚠ cosine bajo — los offsets de una o ambas cámaras pueden estar mal. Revisar a mano.');
+          try { fs.unlinkSync(wavA); fs.unlinkSync(wavB); } catch (e) { /* best-effort */ }
+          verifyCount++;
+        } catch (e) {
+          console.warn('  ' + groupNames[gi] + ' vs ' + groupNames[gj] + ': earshot ab falló — ' + e.message.slice(0, 80));
+        }
+      }
+    }
+    if (!verifyCount) console.log('  (ningún par de cámaras tiene 30s+ de solapamiento para verificar)');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------
 const outClips = clips.map((c) => {
@@ -560,6 +680,9 @@ const outClips = clips.map((c) => {
     referenceTrack: c.finalTrackIndex >= 0 ? refs[c.finalTrackIndex].name : null,
     note: c.unanchoredTrack ? 'su set/referencia no pudo ubicarse en la línea de tiempo compartida (ninguna cámara puenteó el cambio)' : undefined,
     nativePath: c.nativePath.replace(/\\/g, '/'),
+    ...(c.signalQuality ? { signal_quality: c.signalQuality } : {}),
+    ...(c.signalLufs != null ? { signal_lufs: Math.round(c.signalLufs * 10) / 10 } : {}),
+    ...(c.earshotCosine != null ? { earshot_cosine: c.earshotCosine } : {}),
   };
 });
 

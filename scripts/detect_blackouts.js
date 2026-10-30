@@ -22,7 +22,9 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { execFileSync, spawnSync } = require('child_process');
+const earshot = require('./earshot_bridge');
 
 function parseArgs(argv) {
   const out = {};
@@ -40,6 +42,15 @@ if (!args['sync-offsets']) {
   console.error('Uso: node detect_blackouts.js --sync-offsets "<sync_offsets.json>" [--out "<path>"] [--min-black 1.0] [--pad 0.15] [--min-segment 1.5]');
   process.exit(1);
 }
+
+const DO_AUDIO_CAMARAZOS = !!args['audio-camarazos'];
+// Window size and stride for audio camarazo scan. Larger stride = fewer earshot calls = faster.
+// 120s stride means one earshot describe per 2 minutes of clip — reasonable for long continuous clips.
+const AUDIO_WINDOW_S = parseFloat(args['audio-window'] || '60');
+const AUDIO_STRIDE_S = parseFloat(args['audio-stride'] || '120');
+const AUDIO_SILENT_LUFS = parseFloat(args['audio-silent-lufs'] || '-50'); // below this = maybe covered
+const MUFFLED_Z = parseFloat(args['muffled-z'] || '2.0');
+const MUFFLED_AUDIOSET_P = parseFloat(args['muffled-audioset-p'] || '0.3');
 
 const SYNC_PATH = path.resolve(args['sync-offsets']);
 const OUT_PATH = args.out ? path.resolve(args.out) : SYNC_PATH;
@@ -133,6 +144,118 @@ for (const c of data.clips) {
     delete c.segments;
     delete c.blackRanges;
   }
+}
+
+// ---------------------------------------------------------------------------
+// AUDIO CAMARAZOS: earshot-based scan for covered/muffled camera audio (--audio-camarazos).
+// Two-pass strategy to minimize model calls:
+//   Pass 1 (fast, no models): earshot measure on each window. Only flags windows below
+//          AUDIO_SILENT_LUFS as suspicious (might be covered mic or gap between songs).
+//   Pass 2 (models, ~20-60s per call): earshot describe on suspicious windows only.
+//          Confirms muffled/rustling/fabric tags — distinguishes covered mic from genuine silence.
+// Adds confirmed muffled windows to clip.segments exactly like visual blackouts.
+// ---------------------------------------------------------------------------
+if (DO_AUDIO_CAMARAZOS) {
+  if (!earshot.EARSHOT_EXE) {
+    console.warn('\nADVERTENCIA: earshot no encontrado, --audio-camarazos ignorado.');
+  } else {
+    const AUDIO_WORK = path.join(os.tmpdir(), 'detect-audio-camarazos-' + Date.now());
+    fs.mkdirSync(AUDIO_WORK, { recursive: true });
+    console.log('\n--- CAMARAZOS DE AUDIO (earshot, 2 fases) ---');
+    console.log('Ventana:', AUDIO_WINDOW_S + 's | stride:', AUDIO_STRIDE_S + 's | silent_lufs:', AUDIO_SILENT_LUFS);
+    let totalMuffledClips = 0, totalMuffledSeconds = 0;
+
+    for (const c of data.clips) {
+      if (!c.nativePath || !fs.existsSync(c.nativePath)) continue;
+      const duration = c.segments
+        ? c.segments[c.segments.length - 1].end
+        : probeDuration(c.nativePath);
+      if (!duration || isNaN(duration) || duration < AUDIO_WINDOW_S) continue;
+
+      // Pass 1: measure every window (no models)
+      const suspiciousWindows = []; // [{start, end}]
+      const safe = (c.memoria || c.file).replace(/[^A-Za-z0-9._-]/g, '_') + '__' + c.file.replace(/[^A-Za-z0-9._-]/g, '_');
+      let windowStart = 0;
+      while (windowStart + AUDIO_WINDOW_S <= duration) {
+        const wavPath = path.join(AUDIO_WORK, safe + '_' + Math.round(windowStart) + '.wav');
+        try {
+          earshot.extractAudioWav(c.nativePath, wavPath, { start: windowStart, duration: AUDIO_WINDOW_S });
+          const m = earshot.measure(wavPath);
+          const lufs = m.lufs ?? null;
+          if (lufs !== null && lufs < AUDIO_SILENT_LUFS) {
+            suspiciousWindows.push({ start: windowStart, end: windowStart + AUDIO_WINDOW_S, lufs });
+          }
+        } catch (e) { /* skip window, file might not have audio at this offset */ }
+        try { fs.unlinkSync(wavPath); } catch (e) { /* best-effort */ }
+        windowStart += AUDIO_STRIDE_S;
+      }
+
+      if (!suspiciousWindows.length) continue;
+
+      // Pass 2: describe suspicious windows to confirm muffled vs genuine silence
+      const confirmedMuffled = []; // [{start, end}]
+      console.log('  ' + c.file + ': ' + suspiciousWindows.length + ' ventana(s) sospechosa(s) → describe con CLAP...');
+      for (const w of suspiciousWindows) {
+        const wavPath = path.join(AUDIO_WORK, safe + '_desc_' + Math.round(w.start) + '.wav');
+        try {
+          earshot.extractAudioWav(c.nativePath, wavPath, { start: w.start, duration: AUDIO_WINDOW_S });
+          const d = earshot.describe(wavPath);
+          const muffled = isMuffledWindowCustom(d, MUFFLED_Z, MUFFLED_AUDIOSET_P);
+          try { fs.unlinkSync(wavPath); } catch (e) { /* best-effort */ }
+          if (muffled) {
+            const topTag = (d.top_tags || [])[0];
+            console.log('    ' + w.start.toFixed(0) + 's-' + w.end.toFixed(0) + 's: MUFFLED'
+              + (topTag ? ' (top: "' + topTag.term + '" z=' + topTag.z.toFixed(1) + ')' : '')
+              + ' LUFS=' + w.lufs.toFixed(1));
+            confirmedMuffled.push({ start: w.start, end: w.end });
+          } else {
+            console.log('    ' + w.start.toFixed(0) + 's-' + w.end.toFixed(0) + 's: silencio real (sin tags de camarazo)');
+          }
+        } catch (e) {
+          console.warn('    ' + w.start.toFixed(0) + 's: describe falló — ' + e.message.slice(0, 60));
+        }
+      }
+
+      if (!confirmedMuffled.length) continue;
+      totalMuffledClips++;
+
+      // Merge confirmed muffled ranges with existing segments (from visual detection).
+      // Reuse computeSegments by treating muffled windows as extra "black" ranges.
+      const existingBlackRanges = c.blackRanges || [];
+      const allBadRanges = [...existingBlackRanges, ...confirmedMuffled];
+      const clipDur = probeDuration(c.nativePath);
+      const newSegments = allBadRanges.length ? computeSegments(clipDur, allBadRanges) : [{ start: 0, end: clipDur }];
+      const muffledSeconds = confirmedMuffled.reduce((s, r) => s + (r.end - r.start), 0);
+      totalMuffledSeconds += muffledSeconds;
+
+      const isFullClip = newSegments.length === 1 && newSegments[0].start < 0.01 && newSegments[0].end > clipDur - 0.01;
+      if (!isFullClip) {
+        c.segments = newSegments;
+        c.muffledRanges = confirmedMuffled;
+        if (c.blackRanges) c.blackRanges = allBadRanges.filter((r) => existingBlackRanges.includes(r));
+        withCuts++;
+      }
+    }
+
+    // Cleanup temp dir
+    try { fs.rmSync(AUDIO_WORK, { recursive: true }); } catch (e) { /* best-effort */ }
+    console.log('Camarazos de audio: ' + totalMuffledClips + ' clip(s) con secciones tapadas, '
+      + totalMuffledSeconds.toFixed(1) + 's descartados.');
+    console.log('SCOPE: solo detecta audio muffled/tapado. Camarazos apuntados a pisos iluminados → no detectables sin un clasificador visual.');
+  }
+}
+
+function isMuffledWindowCustom(describeResult, zThreshold, audiosetP) {
+  const MUFFLED_TERMS = new Set([
+    'rustling', 'rustle', 'fabric', 'cloth', 'clothing', 'textile',
+    'wind', 'wind noise', 'handling noise', 'muffled', 'rubbing', 'crumpling', 'friction', 'bag', 'pocket',
+  ]);
+  const MUFFLED_AUDIOSET = new Set(['Rustling', 'Cloth, fabric', 'Wind', 'Wind noise']);
+  for (const t of (describeResult.top_tags || []))
+    if (t.z >= zThreshold && MUFFLED_TERMS.has((t.term || '').toLowerCase())) return true;
+  for (const a of (describeResult.audioset || []))
+    if (a.p >= audiosetP && MUFFLED_AUDIOSET.has(a.label)) return true;
+  return false;
 }
 
 fs.writeFileSync(OUT_PATH, JSON.stringify(data, null, 2));
